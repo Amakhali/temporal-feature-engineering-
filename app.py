@@ -4,7 +4,6 @@ import numpy as np
 import joblib
 import matplotlib.pyplot as plt
 import shap
-import os
 
 # Set page config
 st.set_page_config(layout="wide", page_title="Energy Consumption Forecast")
@@ -26,6 +25,7 @@ def cyclical_encoding(df, col, max_val):
     return df
 
 def create_features(df):
+    df = df.copy()
     df['hour'] = df.index.hour
     df['day_of_week'] = df.index.dayofweek
     df['month'] = df.index.month
@@ -33,7 +33,7 @@ def create_features(df):
     df = cyclical_encoding(df, 'day_of_week', 7)
     df = cyclical_encoding(df, 'month', 12)
 
-    # Lag features (adjust to use the last actual load value for the first lag)
+    # Lag features
     df['lag_1'] = df['load'].shift(1)
     df['lag_2'] = df['load'].shift(2)
     df['lag_3'] = df['load'].shift(3)
@@ -50,62 +50,53 @@ def create_features(df):
 
     return df
 
-# --- Prediction Function ---
+# Pre‑compute feature columns (exclude 'load')
+feature_cols = [c for c in test_data.columns if c != 'load']
+
+# --- Prediction Function (iterative, uses actual + predicted values) ---
 def make_prediction(input_date, hours_to_predict=24):
-    # Create a DataFrame for predictions starting from the input_date
+    # Create a DataFrame for predictions
     future_dates = pd.date_range(start=input_date, periods=hours_to_predict, freq='h')
     future_df = pd.DataFrame(index=future_dates)
 
-    # Initialize 'load' column for feature creation. We'll fill this with actual/predicted values
-    # Use the last known 'load' value from test_data to initialize for the first prediction
-    last_known_load_date = test_data.index[-1]
-    last_known_load_value = test_data['load'].iloc[-1]
+    # Combine historical data and future dates to have a continuous time series
+    # We need the last 168 hours of actual data before input_date to compute initial lags/rolling stats
+    history = test_data.loc[test_data.index < input_date].tail(200)  # extra margin
+    combined = pd.concat([history, future_df])
 
-    # Combine test data and future_df to generate features correctly
-    # This is crucial for lag and rolling features to propagate correctly
-    combined_df = pd.concat([test_data, future_df])
-
+    # We will fill the future load values iteratively
     predictions = []
-    for i in range(hours_to_predict):
-        current_date = future_df.index[i]
 
-        # For the first prediction, use the last known load value to compute lags/rolling features
-        if i == 0 and current_date == input_date:
-            temp_df = combined_df.loc[:current_date].copy()
-            temp_df.loc[current_date, 'load'] = last_known_load_value # Placeholder, will be replaced by prediction
+    for i, dt in enumerate(future_dates):
+        # Create a window that includes enough history (at least 200 hours back)
+        window_start = dt - pd.Timedelta(hours=200)
+        window = combined.loc[window_start:dt].copy()
 
-        else:
-            # For subsequent predictions, use previous predicted values for lags
-            temp_df = combined_df.loc[:current_date].copy()
+        # Compute features for the window (this fills all columns)
+        window = create_features(window)
 
-            # Fill 'load' with previous predictions for feature generation
-            for j, pred_date in enumerate(future_df.index[:i]):
-                temp_df.loc[pred_date, 'load'] = predictions[j]
+        # Get the row for the current timestamp (the one we want to predict)
+        current_row = window.loc[[dt]].copy()
 
-        temp_df = create_features(temp_df.copy())
-        current_features = temp_df.loc[current_date].drop('load', errors='ignore')
+        # Select only the feature columns (exclude 'load')
+        X = current_row[feature_cols]
 
-        # Ensure feature columns match training order and number
-        feature_cols = [c for c in test_data.drop('load', axis=1).columns if c in current_features.index]
-        current_features = current_features[feature_cols]
+        # Check for NaNs in features; if any, fill them (should not happen if we have enough history)
+        if X.isnull().any().any():
+            # Forward fill, then backward fill, then 0
+            X = X.fillna(method='ffill').fillna(method='bfill').fillna(0)
 
-        # Handle potential NaNs introduced by feature engineering at the beginning of the prediction horizon
-        # For lags, if there isn't enough historical data, we need to decide how to fill.
-        # A simple approach is to ffill or use a default, but for robustness, it should be part of training prep.
-        # For this demo, we assume enough data for features to be non-NaN after 'test_data'.
-        if current_features.isnull().any():
-            # If there are NaNs, fill them appropriately. For simplicity here, we'll ffill, but consider more robust imputation.
-            current_features = current_features.fillna(method='ffill').fillna(method='bfill') # ffill then bfill for start of series
-            # As a fallback, use 0 if still NaN (should not happen with ffill/bfill if any data exists)
-            current_features = current_features.fillna(0)
+        # Scale
+        X_scaled = scaler.transform(X)
 
-        current_features_scaled = scaler.transform(current_features.values.reshape(1, -1))
-        pred = model.predict(current_features_scaled)[0]
+        # Predict
+        pred = model.predict(X_scaled)[0]
         predictions.append(pred)
-        combined_df.loc[current_date, 'load'] = pred # Update combined_df with prediction for next iteration's features
+
+        # Store the predicted load for use in subsequent iterations
+        combined.loc[dt, 'load'] = pred
 
     return pd.Series(predictions, index=future_dates)
-
 
 # --- Streamlit UI ---
 st.title("Hourly Energy Consumption Forecast")
@@ -120,13 +111,13 @@ min_date = test_data.index.min()
 
 prediction_start_date = st.sidebar.date_input(
     "Select Prediction Start Date",
-    value=max_date, # Default to the last date in test data
+    value=max_date,
     min_value=min_date,
-    max_value=pd.to_datetime('2025-01-01') # Allow forecasting a bit into the future
+    max_value=pd.to_datetime('2025-01-01')
 )
 prediction_start_datetime = pd.to_datetime(prediction_start_date)
 
-hours_to_predict = st.sidebar.slider("Hours to Forecast", 1, 168, 24) # Up to 7 days
+hours_to_predict = st.sidebar.slider("Hours to Forecast", 1, 168, 24)
 
 if st.sidebar.button("Generate Forecast"):
     st.subheader(f"Energy Consumption Forecast from {prediction_start_datetime.strftime('%Y-%m-%d %H:00')} for {hours_to_predict} hours")
@@ -145,7 +136,7 @@ if st.sidebar.button("Generate Forecast"):
     ax.plot(forecast.index, forecast.values, label='Forecast', color='red', linestyle='--')
     ax.set_title('Energy Consumption Forecast')
     ax.set_xlabel('Datetime')
-    ax.set_ylabel('Load')
+    ax.set_ylabel('Load (MW)')
     ax.legend()
     st.pyplot(fig)
 
@@ -153,63 +144,55 @@ if st.sidebar.button("Generate Forecast"):
     st.subheader("Feature Importance (SHAP Values)")
     st.write("Understanding which features contribute most to the model's predictions.")
 
-    # Use a subset of X_test for SHAP to avoid long computation times
-    # Ensure X_test_scaled is available or re-create it
-    # For this app, we'll recreate X_test and scale it if not available globally from colab
-    # The cached load_resources() ensures test_data is ready.
+    # Prepare SHAP data (use a sample of the test set)
+    processed_test = create_features(test_data.copy()).dropna()
+    X_test_shap = processed_test[feature_cols]
 
-    # Re-process test_data to get features as done in training
-    processed_test_data = create_features(test_data.copy())
-    processed_test_data = processed_test_data.dropna() # Drop NaNs from feature creation
-
-    # Align feature columns with training order
-    feature_cols = [c for c in processed_test_data.columns if c != 'load']
-    X_test_for_shap = processed_test_data[feature_cols]
-
-    if not X_test_for_shap.empty:
-        # Select a sample for SHAP for faster calculation
-        if len(X_test_for_shap) > 1000:
-            X_test_sample = X_test_for_shap.sample(n=1000, random_state=42)
-        else:
-            X_test_sample = X_test_for_shap
-
-        X_test_sample_scaled = scaler.transform(X_test_sample)
+    if not X_test_shap.empty:
+        # Use a random sample to keep performance reasonable
+        sample_size = min(1000, len(X_test_shap))
+        X_sample = X_test_shap.sample(n=sample_size, random_state=42)
+        X_sample_scaled = scaler.transform(X_sample)
 
         try:
-            explainer = shap.TreeExplainer(model)
-            shap_values = explainer.shap_values(X_test_sample_scaled)
+            # Cache the explainer (expensive)
+            @st.cache_resource
+            def get_explainer():
+                return shap.TreeExplainer(model)
+
+            explainer = get_explainer()
+            shap_values = explainer.shap_values(X_sample_scaled)
 
             st.write("**Summary Plot:**")
             fig_shap, ax_shap = plt.subplots(figsize=(10, 6))
-            shap.summary_plot(shap_values, X_test_sample_scaled, feature_names=X_test_sample.columns, show=False)
+            shap.summary_plot(shap_values, X_sample_scaled, feature_names=feature_cols, show=False)
             st.pyplot(fig_shap)
-            plt.clf() # Clear plot to prevent overlap
+            plt.clf()
 
             st.write("**Individual Prediction Explanation (First Forecast Point):**")
-            # Explain the first point of the generated forecast
+            # Re‑create the exact input for the first forecast point
             if not forecast.empty:
                 first_forecast_date = forecast.index[0]
-                # Need to recreate features for this specific point to get the exact scaled input
-                # This is a bit complex as make_prediction does it internally. Re-run for just this point.
-                temp_df_for_shap = pd.concat([test_data, pd.DataFrame(index=[first_forecast_date])])
-                temp_df_for_shap.loc[first_forecast_date, 'load'] = test_data['load'].iloc[-1] # Use last known for initial feature gen
-                temp_df_for_shap = create_features(temp_df_for_shap.copy())
-                current_features_for_shap = temp_df_for_shap.loc[first_forecast_date].drop('load', errors='ignore')
-                current_features_for_shap = current_features_for_shap[feature_cols].fillna(method='ffill').fillna(method='bfill').fillna(0) # Ensure no NaNs
+                # Build a combined dataframe that ends at the first forecast date
+                # and includes the last actual value for that timestamp
+                temp_df = pd.concat([test_data.tail(200), pd.DataFrame(index=[first_forecast_date])])
+                temp_df.loc[first_forecast_date, 'load'] = test_data['load'].iloc[-1]  # initial guess (will be overwritten later)
+                temp_df = create_features(temp_df)
+                X_first = temp_df.loc[[first_forecast_date], feature_cols]
+                # Handle any NaNs (should be rare)
+                X_first = X_first.fillna(method='ffill').fillna(method='bfill').fillna(0)
+                X_first_scaled = scaler.transform(X_first)
 
-                current_features_for_shap_scaled = scaler.transform(current_features_for_shap.values.reshape(1, -1))
+                shap_first = explainer.shap_values(X_first_scaled)
 
-                # Re-calculate SHAP values for this single instance
-                shap_values_single = explainer.shap_values(current_features_for_shap_scaled)
-
+                # Force plot for this single instance
                 fig_force, ax_force = plt.subplots(figsize=(10, 2))
-                shap.force_plot(explainer.expected_value, shap_values_single[0], current_features_for_shap_scaled[0],
-                                feature_names=X_test_sample.columns, matplotlib=True, show=False)
+                shap.force_plot(explainer.expected_value, shap_first[0], X_first_scaled[0],
+                                feature_names=feature_cols, matplotlib=True, show=False)
                 st.pyplot(fig_force)
                 plt.clf()
-
         except Exception as e:
-            st.error(f"Could not generate SHAP plots: {e}. Ensure SHAP is compatible with the model and data structure.")
+            st.error(f"Could not generate SHAP plots: {e}. Please ensure SHAP is installed and compatible.")
     else:
         st.warning("Not enough data to generate SHAP explanations.")
 
