@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -54,7 +53,7 @@ def create_features(df):
 # --- Prediction Function ---
 def make_prediction(input_date, hours_to_predict=24):
     # Create a DataFrame for predictions starting from the input_date
-    future_dates = pd.date_range(start=input_date, periods=hours_to_predict, freq='H')
+    future_dates = pd.date_range(start=input_date, periods=hours_to_predict, freq='h')
     future_df = pd.DataFrame(index=future_dates)
 
     # Initialize 'load' column for feature creation. We'll fill this with actual/predicted values
