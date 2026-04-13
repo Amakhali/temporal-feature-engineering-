@@ -84,7 +84,7 @@ def make_prediction(input_date, hours_to_predict=24):
         # Check for NaNs in features; if any, fill them (should not happen if we have enough history)
         if X.isnull().any().any():
             # Forward fill, then backward fill, then 0
-            X = X.fillna(method='ffill').fillna(method='bfill').fillna(0)
+           X = X.ffill().bfill().fillna(0)
 
         # Scale
         X_scaled = scaler.transform(X)
